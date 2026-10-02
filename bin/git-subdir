@@ -1,0 +1,780 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+#========================================================================#
+
+=pod
+
+=head1 NAME
+
+git-subdir - Operate on a directory full of git repositories.
+
+=head1 OPTIONS
+
+B<git-subdir> [ -h|--help ]
+              [ --colour | --no-colour ]
+              [ --branches ]
+              [ --update ]
+              [ --status ]
+              [ --versions ]
+
+=head1 SYNOPSIS
+
+Many projects I work on require several git repositories to be checked out
+within a single directory in order to build all of the required components.
+The directory structure of the project might well look something like this
+then:
+
+  project-root/
+            git-repo-a
+            git-repo-b
+            git-repo-c
+
+I frequently need to perform operations on all of the sub-repositories, for
+example, find out which branches are checked out in each, or perform a
+fetch for all of the sub-repositories.
+
+This script adds a new git sub-command I<subdir> that allows git to operate
+on a repository struture like the one described above.
+
+When displaying results, repository names that have a prefix '+ ' are git
+worktrees, not full repositories.  These are displayed below the full
+repository for which they are a worktree.
+
+=head1 OPTIONS
+
+=over 2
+
+=item B<--update>
+
+Enter each of the sub-repositories and perform an update, as described in
+L</"WHAT IS AN UPDATE">.
+
+=item B<--branches>
+
+Causes information about the current branch in each of the sub-repositories
+to be displayed.  Currently this option is on by default, and can't be
+turned off.  As this script gains more options then this flag might start
+to have more meaning.
+
+=item B<--status>
+
+Display status about each git sub-repository, this includes the number of
+patches ahead and behind the upstream branch, along with the number of
+local changes, and the number of untracked files.
+
+=item B<--colour> | B<--no-color>
+
+By default colour is used in the output.  Use B<--no-color> to disable
+colour in the output.
+
+=item B<--help> | B<-h>
+
+Display this help text.  This option does not work when run through git, as
+git parses off the '--help' option and then looks for a man page
+corresponding to the command.
+
+=back
+
+=head1 WHAT IS AN UPDATE
+
+An update in the context of a directory full of git repositories means the
+following:
+
+=over 2
+
+=item Fetch
+
+A fetch is performed from all of the remotes that might be configured
+within a single repository.  A single git repository will frequently have
+multiple remotes set up.
+
+=item Fast Forward
+
+A fast forward update is performed of the current active branch.  This will
+only succeed if there are no local commits to the branch.  This suits the
+way in which I prefer to work, but might not be the best solution for
+everyone.
+
+=back
+
+=cut
+
+#========================================================================#
+
+use List::Util qw/max/;
+use Pod::Usage;                 # Allow -h or --help command line options.
+use boolean;
+use Cwd;
+use Getopt::Long;
+use Carp::Assert;
+use File::Spec;
+
+#========================================================================#
+
+my $SHA_LENGTH = 10;
+my ($PASS_STRING, $FAIL_STRING) = (undef, undef);
+
+#========================================================================#
+
+exit main ();
+
+#========================================================================#
+
+=pod
+
+=head1 METHODS
+
+The following methods are defined in this script.
+
+=over 2
+
+=cut
+
+#========================================================================#
+
+=pod
+
+=item B<main>
+
+Currently undocumented.
+
+=cut
+
+sub main {
+  my $use_colour = true;
+  my $update => false;
+  my $branches => false;
+  my $status => false;
+  my $help = false;
+  GetOptions ("colour!" => \$use_colour,
+              "update" => \$update,
+              "branches" => \$branches,
+              "status" => \$status,
+              "help|h" => \$help) or pod2usage (2);
+  pod2usage (1) if ($help);
+
+  ($update or $branches or $status) or pod2usage (1);
+
+  # Actually, we always display the branches, so...
+  $branches = true;
+
+  if ($use_colour)
+  {
+    $PASS_STRING = "\033[0;32mPass\033[0m";
+    $FAIL_STRING = "\033[0;31mFail\033[0m";
+  }
+  else
+  {
+    $PASS_STRING = "Pass";
+    $FAIL_STRING = "Fail";
+  }
+
+  $| = true;                    # Autoflush
+
+  print "Finding repositories.....";
+  my @repo = find_repositories ();
+  my $repo_len = max (map { longest_repo_name ($_) } @repo);
+  my $br_len = max (map { longest_branch_name ($_) } @repo);
+  print "".scalar (@repo)." found.\n";
+
+  # If there are no repositories, then we're done.
+  exit (0) if (scalar (@repo) == 0);
+
+  @repo = sort {$a->{-name} cmp $b->{-name}} @repo;
+
+  $repo_len = max ( $repo_len, 4);
+  $br_len = max ($br_len, 6);
+
+  printf "| %-".$repo_len."s | %-".$br_len."s |", "Repo", "Branch";
+  printf " %-".$SHA_LENGTH."s |", "SHA" if ($branches);
+  print " Fetch | FF   |" if ($update);
+  print " Commits | Local Ch. | Untracked |" if ($status);
+  print "\n";
+
+  print "+-".("-"x$repo_len)."-+-".("-"x$br_len)."-+";
+  print "-".("-"x $SHA_LENGTH)."-+" if ($branches);
+  print "-".("-"x 5)."-+-".("-"x 4)."-+" if ($update);
+  print "-".("-"x 7)."-+-".("-"x 9)."-+-".("-"x 9)."-+" if ($status);
+  print "\n";
+
+  foreach my $r (@repo)
+  {
+    print_repo_line ($r, $repo_len, $br_len, $branches, $update, $status, "");
+
+    my @wt = sort {$a->{-name} cmp $b->{-name}} @{$r->{-worktrees}};
+    foreach my $wt (@wt)
+    {
+      print_repo_line ($wt, $repo_len, $br_len, $branches, $update, $status, "+ ");
+    }
+  }
+}
+
+#========================================================================#
+
+=pod
+
+=item B<format_repo_line>
+
+Currently undocumented.
+
+=cut
+
+sub print_repo_line {
+  my $r = shift;
+  my $repo_len = shift;
+  my $br_len = shift;
+  my $branches = shift;
+  my $update = shift;
+  my $status = shift;
+  my $name_prefix = shift;
+
+  my $br = $r->{-branch};
+  $br = "????" unless (defined $br);
+
+  printf "| %-".$repo_len."s | %-".$br_len."s |",
+    ($name_prefix . $r->{-name}), $br;
+
+  if ($branches)
+  {
+    my $sha = $r->{-sha};
+    $sha = "????" unless (defined $sha);
+    printf " %".$SHA_LENGTH."s |", $sha;
+  }
+
+  if ($update)
+  {
+    if ((defined $br)
+          and (exists $r->{-remotes})
+          and (scalar (@{$r->{-remotes}}) > 0))
+    {
+      if (git_fetch ($r->{-path}))
+      {
+        printf "  %s |", $PASS_STRING;
+
+        if (git_fast_forward ($r->{-path}))
+        {
+          printf " %s |", $PASS_STRING;
+        }
+        else
+        {
+          printf " %s |", $FAIL_STRING;
+        }
+      }
+      else
+      {
+        printf "  %s |  N/A |", $FAIL_STRING;
+      }
+    }
+    elsif (not (exists ($r->{-remotes})))
+    {
+      # If there's no '-remotes' entry, then this is worktree, not a full
+      # repository.  In this case we don't need to do the fetch (the full
+      # repository has already been processed) but we do want to try a
+      # fast-forward.
+      print "   N/A |";
+
+      if (git_fast_forward ($r->{-path}))
+      {
+        printf " %s |", $PASS_STRING;
+      }
+      else
+      {
+        printf " %s |", $FAIL_STRING;
+      }
+    }
+    else
+    {
+      # There is a '-remotes' entry, but the list is empty.  This is a full
+      # repository, but there's not remote.
+      print "   N/A |  N/A |";
+
+      if (scalar (@{$r->{-remotes}}) == 0)
+      {
+        print " (No remotes)";
+      }
+    }
+  }
+
+  if ($status)
+  {
+    # Print +X/-Y for patches ahead/behind.
+    my ($ahead,$behind) = git_get_ahead_behind_counts ($r->{-path});
+    printf " %7s |", "+${ahead}/-${behind}";
+
+    my ($local, $untracked) = git_count_local_and_untracked ($r->{-path});
+    # Print Yes/No for local changes.
+    if ($local > 0)
+    {
+      printf " %9s |", "Yes ($local)";
+    }
+    else
+    {
+      printf " %9s |", "No";
+    }
+
+    # Print Yes/No for untracked files.
+    if ($untracked > 0)
+    {
+      printf " %9s |", "Yes ($untracked)";
+    }
+    else
+    {
+      printf " %9s |", "No";
+    }
+  }
+
+  print "\n";
+}
+
+#========================================================================#
+
+=pod
+
+=item B<longest_branch_name>
+
+Takes a hash reference that is a repository, and returns the length of the
+longest name.  This involves considerinng both the top-level repository,
+and also any worktrees for that repository.
+
+=cut
+
+sub longest_branch_name {
+  my $repo = shift;
+
+  my $max_len = safe_length ($repo->{-branch});
+  foreach my $wt (@{$repo->{-worktrees}})
+  {
+    $max_len = max ($max_len, (safe_length ($wt->{-branch})));
+  }
+
+  return $max_len;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<longest_repo_name>
+
+Takes a hash reference that is a repository, and returns the length of the
+longest name.  This involves considerinng both the top-level repository,
+and also any worktrees for that repository.
+
+When considering the names of any worktrees we add two to the length as
+when printed in the table we add a 2 character prefix to indicate that it
+is a worktree.
+
+=cut
+
+sub longest_repo_name {
+  my $repo = shift;
+
+  my $max_len = safe_length ($repo->{-name});
+  foreach my $wt (@{$repo->{-worktrees}})
+  {
+    $max_len = max ($max_len, (safe_length ($wt->{-name}) + 2));
+  }
+
+  return $max_len;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<get_worktrees>
+
+Currently undocumented.
+
+=cut
+
+sub get_worktrees {
+  my $repo = shift;
+  my $orig_dir = shift;
+
+  my $wt_dir = $repo."/.git/worktrees";
+  (-d $wt_dir) or return ();
+
+  my @candidates = ();
+
+  opendir (my $dh, $wt_dir) or
+    die "Failed to open '$wt_dir' for reading: $!";
+  while (readdir $dh)
+  {
+    next if (m/^\./);
+    my $gitdir_file = $wt_dir."/$_/gitdir";
+    push @candidates, $gitdir_file if (-r "$gitdir_file");
+  }
+  closedir $dh or
+    die "Failed to close '$wt_dir' after reading: $!";
+
+  my @worktrees = ();
+  foreach my $c (@candidates)
+  {
+    my $path = `cat $c`;
+    chomp $path;
+    $path =~ s#/.git$##;
+
+    if (-d $path)
+    {
+      my $br = git_current_branch ("$path");
+      my $sha = git_current_sha ("$path", $SHA_LENGTH);
+      my $name = File::Spec->abs2rel ($path, $orig_dir);
+
+      my $worktree = { -name => $name,
+                       -path => $path,
+                       -branch => $br,
+                       -sha => $sha };
+      push @worktrees, $worktree;
+    }
+  }
+
+  return @worktrees;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<git_count_local_and_untracked>
+
+Take the full path to a repository.  Return a list of two items, the number
+of local changes, and the number of untracked files.  If there's any
+problems then the numbers 0, 0 will be returned.
+
+The number of local changes, and untracked files are extracted from:
+
+    git status --porcelain
+
+=cut
+
+sub git_count_local_and_untracked {
+  my $repo = shift;
+
+  my $cwd = getcwd () or return ();
+  chdir $repo or return ();
+
+  my $output = `git status --porcelain`;
+  my $success = ($? == 0);
+
+  chdir $cwd or return ();
+  return (0, 0) unless ($success);
+
+  my @lines = split (/\n/, $output);
+  my ($local, $untracked) = (0,0);
+
+  foreach (@lines)
+  {
+    $local++ if ((m/^ M/) or (m/^M /));
+    $untracked++ if (m/^??/);
+  }
+
+  return ($local, $untracked);
+}
+
+#========================================================================#
+
+=pod
+
+=item B<git_get_ahead_behind_counts>
+
+Take the full path to a repository.  Return a list of two items, the number
+of commits ahead and behind the upstream branch.  If anything goes wrong
+then the numbers 0, 0 will be returned.
+
+The commits are extracted by examining the output of this command:
+
+    git rev-list --left-right --boundary @{u}...
+
+=cut
+
+sub git_get_ahead_behind_counts {
+  my $repo = shift;
+
+  my $cwd = getcwd () or return ();
+  chdir $repo or return ();
+
+  my $output = `git rev-list --left-right --boundary \@{u}... 2>/dev/null`;
+  my $success = ($? == 0);
+
+  chdir $cwd or return ();
+  return (0, 0) unless ($success);
+
+  my @commits = split (/\n/, $output);
+  my ($ahead, $behind) = (0,0);
+
+  foreach (@commits)
+  {
+    $ahead++ if (m/^>/);
+    $behind++ if (m/^</);
+  }
+
+  return ($ahead, $behind);
+}
+
+#========================================================================#
+
+=pod
+
+=item B<git_remote_names>
+
+Take the full path to a repository.  Return a list containing the names of
+all remotes configured for this repository.  If there are no remotes, or
+the list of remote names could not be obtained, then return the empty list.
+
+The remote names are obtained using:
+
+    git remote
+
+=cut
+
+sub git_remote_names {
+  my $repo = shift;
+
+  my $cwd = getcwd () or return ();
+  chdir $repo or return ();
+
+  my $output = `git remote 2>/dev/null`;
+  my $success = ($? == 0);
+
+  chdir $cwd or return ();
+  return () unless ($success);
+
+  my @repo = split (/\n/, $output);
+
+  return @repo;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<git_fast_forward>
+
+Take the full path to a repository and perform a fast forward within the
+repository.  Return true if the fast forward was a success, otherwise
+return false.
+
+The fast forward is performed with the following command:
+
+    git ff
+
+This is a special git alias that I have configured, see my ~/.gitconfig for
+details.
+
+=cut
+
+sub git_fast_forward {
+  my $repo = shift;
+
+  my $cwd = getcwd () or return false;
+  chdir $repo or return false;
+
+  `git ff >/dev/null 2>/dev/null`;
+  my $status = ($? == 0);
+
+  chdir $cwd or return false;
+  return $status;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<git_fetch>
+
+Take the full path to a repository.  Fetch from all remotes configured
+within that repository.  Return true if the fetch was a success, otherwise
+return false.
+
+The fetch is performed with the following command:
+
+    git fetch --all
+
+=cut
+
+sub git_fetch {
+  my $repo = shift;
+
+  my $cwd = getcwd () or return false;
+  chdir $repo or return false;
+
+  `git fetch --all >/dev/null 2>/dev/null`;
+  my $status = ($? == 0);
+
+  chdir $cwd or return false;
+  return $status;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<git_current_branch>
+
+Take the full path to a repository.  Try to determine the currently active
+branch in the repository and return the branch name as a string.  If the
+current branch can't be determined, then return undef.
+
+To figure out the current branch the following command is used:
+
+    git rev-parse --abbrev-ref HEAD
+
+=cut
+
+sub git_current_branch {
+  my $repo = shift;
+
+  my $cwd = getcwd ();
+  chdir $repo or return undef;
+
+  my $branch = `git rev-parse --abbrev-ref HEAD 2>/dev/null`;
+  if (($? != 0) || ($branch eq ""))
+  {
+    $branch = undef;
+  }
+
+  chomp $branch if (defined $branch);
+  chdir $cwd or return undef;
+  return $branch;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<git_current_sha>
+
+Take the full path to a repository.  Try to determine the SHA for the head
+of the currently active branch in the repository and return the sha as a
+string.  If the current sha can't be determined, then return undef.
+
+The optional second parameter to this function is the length of the SHA to
+return.  This is passed on to the git command.  If this length is not
+supplied then 10 is used.
+
+To figure out the current branch the following command is used:
+
+    git rev-parse --short=LENGTH HEAD
+
+=cut
+
+sub git_current_sha {
+  my $repo = shift;
+  my $length = shift;
+
+  $length = 10 unless (defined ($length));
+  assert ($length =~ m/^\d+$/);
+
+  my $cwd = getcwd ();
+  chdir $repo or return undef;
+
+  my $sha = `git rev-parse --short=$length HEAD 2>/dev/null`;
+  if (($? != 0) || ($sha eq ""))
+  {
+    $sha = undef;
+  }
+
+  chomp $sha if (defined $sha);
+  chdir $cwd or return undef;
+  return $sha;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<safe_length>
+
+Take a string parameter, and return the length.  If the string is undefined
+then return a length of 0.
+
+=cut
+
+sub safe_length {
+  my $str = shift;
+  return (defined $str) ? length ($str) : 0;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<find_repositories>
+
+Find all git repositories below the current working directory.  A git
+repository is a directory that contains a subdirectory called I<.git>.
+
+The return value is a list of hashes, one hash for each repository found.
+
+For each repository found the hash contains the following keys:
+
+=over 2
+
+=item I<-name>
+
+The name of the repository directory.
+
+=item I<-path>
+
+The full path to the repository directory.
+
+=item I<-branch>
+
+The name of the currently active branch in the repository, or undef if the
+active branch could not be determined.  To determine the currently active
+branch a call to I<git_current_branch> is made.
+
+=back
+
+=cut
+
+sub find_repositories {
+  my $cwd = getcwd ();
+
+  my @candidate_list;
+  opendir (my $dh, $cwd) or
+    die "Failed to open '$cwd' for reading: $!";
+  while (readdir $dh)
+  {
+    next if (/^\./);
+    push @candidate_list, $_ if (-d "$cwd/$_");
+  }
+  closedir $dh or
+    die "Failed to close '$cwd' after reading: $!";
+
+  my @repo_list;
+  foreach my $name (@candidate_list)
+  {
+    if (-d "$cwd/$name/.git")
+    {
+      my $br = git_current_branch ("$cwd/$name");
+      my $sha = git_current_sha ("$cwd/$name", $SHA_LENGTH);
+      my @remotes = git_remote_names ("$cwd/$name");
+      my @worktrees = get_worktrees ("$cwd/$name", "$cwd");
+      push @repo_list, { -name => $name,
+                         -path => "$cwd/$name",
+                         -branch => $br,
+                         -sha => $sha,
+                         -remotes => \@remotes,
+                         -worktrees => \@worktrees };
+    }
+  }
+
+  return @repo_list;
+}
+
+#========================================================================#
+
+=pod
+
+=back
+
+=head1 AUTHOR
+
+Andrew Burgess, 29 Apr 2015
+
+=cut

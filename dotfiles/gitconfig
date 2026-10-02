@@ -1,0 +1,82 @@
+[user]
+	email = aburgess@redhat.com
+	name = Andrew Burgess
+[alias]
+	st=status
+	sst=status --short --branch
+	co=checkout
+	br=branch
+	ff=ff-merge
+	lg=log --graph --pretty=format:"%C(auto)%h%d\\ %C(reset)%s%C(blue)\\ [%an\\ (%cr)]%C(reset)"
+	slg=log --simplify-by-decoration --full-history --graph --pretty=format:"%C(auto)%h%C(red)%d%C(reset)"
+	youngest-ancestor = !bash -c 'git rev-parse --short $(diff --old-line-format= --new-line-format= <(git rev-list --first-parent \"${1:-master}\") <(git rev-list --first-parent \"${2:-HEAD}\") | head -1)' -
+        show-patch=show --patch --format="%C(auto)%h\\ %s\\ %C(blue)[%an\\ (%cr)]%C(reset)"
+        sp=show-patch
+        edit-conflicts = !bash -c 'git diff --name-only --diff-filter=U | xargs emacs'
+        ec=!bash -c 'git edit-conflicts'
+	branchdiff = !sh -c \"git diff `git oldest-ancestor`..\"
+	branchlog = !sh -c \"git log `git oldest-ancestor`..\"
+        wdiff=diff --word-diff=color
+        fall=fetch --all
+        lr=remote -v
+        count-conflicts = !bash -c 'git diff --name-only --diff-filter=U | xargs grep -c \"<<<<<<\"'
+        brr = "!f() { git bgrep $@ .\\*;  }; f"
+        fstat = "!f() { git diff-tree --no-commit-id --stat=$(tput cols) -r ${1:-HEAD}; }; f"
+        check=show --check --format="%C(auto)%h\\ %s\\ %C(blue)[%an\\ (%cr)]%C(reset)"
+        lb = !git reflog show --single-worktree --pretty=format:'%gs ~ %gd' --date=relative | grep 'checkout:\\|Branch: renamed' | grep -oE '[^ ]+ ~ .*' | sed 'sX^refs/heads/XX' | awk -F~ '!seen[$1]++' | head -n 10 | awk -F' ~ HEAD@{' '{printf(\"  \\033[33m%-12s: \\033[36m %s\\033[0m\\n\", substr($2, 1, length($2)-1), $1)}'
+
+[color]
+	ui = auto
+[push]
+	default = simple
+
+[sendemail]
+	smtpserver = /usr/bin/msmtp
+
+[gpg]
+	program = gpg2
+
+[merge "merge-changelog"]
+	name = GNU ChangeLog merge driver
+	driver = git-merge-changelog %O %A %B
+
+[diff]
+        algorithm = histogram
+        colorMoved = plain
+        mnemonicPrefix = true
+        renames = true
+
+[diff "texinfo"]
+	xfuncname = ^@node[\t ][\t ]*([^,][^,]*)
+
+[tag]
+        sort = version:refname
+
+[column]
+        ui = auto
+
+[transfer]
+        fsckObjects = true
+[fetch]
+        prune = true
+
+[core]
+        whitespace = space-before-tab,indent-with-non-tab,trailing-space
+        #fsmonitor = true
+        #untrackedCache = true
+
+[format]
+        outputDirectory = patches
+        useAutoBase = true
+        coverLetter = auto
+        thread = shallow
+
+[branch]
+        sort = -committerdate
+
+[help]
+        autocorrect = prompt
+
+[rerere]
+        enabled = true
+        autoupdate = true

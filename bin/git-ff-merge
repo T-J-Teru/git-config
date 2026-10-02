@@ -1,0 +1,103 @@
+#!/bin/bash
+
+# Usage:
+#
+#    git ff-merge [-v] [-n] [--help]
+#
+# If the current HEAD is a remote tracking branch then try to perform
+# a fast-forward merge with the remote branch.
+#
+# With -v, display information about what is being done.
+#
+# With -n, don't actually perform the fast-forward, but display the
+# git command that would be issued.
+#
+# With --help, display a short usage message and exit.
+
+function help ()
+{
+  echo "Usage:"
+  echo ""
+  echo "  git ff-merge [-v] [-n] [--help]"
+  echo ""
+  echo "Perform a fast-forward merge against remote tracking branch"
+  echo "matching the current branch."
+  echo ""
+  echo "With -v for verbose, -n for a dry run, don't change anything,"
+  echo "or -h to get this help message."
+  exit 0
+}
+
+verbose=
+dry_run=
+
+function verbose ()
+{
+  if [ "x$verbose" != "x" ]
+  then
+    echo "$@"
+  fi
+}
+
+function error ()
+{
+  echo "$@"
+  exit 1
+}
+
+# Command line option parsing.
+TEMP=`getopt -o vnh --long help,verbose,dry-run -n $0 -- "$@"`
+if [ $? != 0 ]
+then
+  echo "Failed to parse command line arguments."
+  exit 1
+fi
+
+eval set -- "$TEMP"
+
+while true
+do
+  case "$1" in
+      -v|--verbose) verbose=yes; shift ;;
+      -n|--dry-run) dry_run=yes; shift ;;
+      -h|--help) help ; shift ;;
+      --) shift; break ;;
+      *) echo "Unknown argument: $1"; exit 1 ;;
+  esac
+done
+
+# Now figure out the remote branch we're tracking.
+symbolic_ref_head=$(git symbolic-ref -q HEAD)
+if [ $? -ne 0 ]
+then
+  error "HEAD is not a symbolic reference."
+fi
+
+branch=$(echo ${symbolic_ref_head} | cut -d '/' -f 3)
+remote=$(git config "branch.${branch}.remote")
+if [ $? -ne 0 ]
+then
+  error "No remote for local branch ${branch}."
+fi
+
+remote_branch=$(git config "branch.${branch}.merge")
+if [ $? -ne 0 ]
+then
+    error "No remote branch for local branch ${branch}."
+fi
+
+remote_branch=${remote_branch##refs/heads/}
+merge_branch=${remote}/${remote_branch}
+
+# Finally, display some verbose output, and perform the fast-forward
+verbose "branch: $branch"
+verbose "remote: $remote"
+verbose "remote branch: $remote_branch"
+
+if [ "x${dry_run}" == "x" ]
+then
+  verbose "git merge --ff-only ${remote}/${remote_branch}"
+  exec git merge --ff-only ${remote}/${remote_branch}
+else
+  echo "git merge --ff-only ${remote}/${remote_branch}"
+fi

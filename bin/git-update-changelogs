@@ -1,0 +1,487 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+no indirect;
+no autovivification;
+
+#========================================================================#
+
+=pod
+
+=head1 NAME
+
+git-update-changelogs - Patch ChangeLog dates in most recent commit.
+
+=head1 OPTIONS
+
+B<git-update-changelogs> [-h|--help]
+                         [--fix-last-commit]
+                         [--no-commit]
+                         [--date=DATE]
+                         [<upstream>]
+
+=head1 SYNOPSIS
+
+All commits on the current branch but not in <upstream> will have their
+new ChangeLog entries updated; the date will be modified to todays date.
+
+=cut
+
+#========================================================================#
+
+use boolean;
+use Pod::Usage;                 # Allow -h or --help command line options.
+use File::Copy;
+use POSIX qw/strftime/;
+use Getopt::Long;
+use File::Temp qw/tempfile/;
+
+#========================================================================#
+
+my $config = parse_command_line ();
+
+# We might be in a sub-directory of the git repository.  In order to find
+# and patch all of the ChangeLog files correctly it is easiest if we move
+# to the root directory of the repository.
+chdir_to_repository_root ();
+
+if ($config->{__fix_last_commit__})
+{
+  fix_last_commit ($config);
+}
+else
+{
+  start_rebase ($config);
+}
+
+die "should not get here";
+
+#========================================================================#
+
+=pod
+
+=head1 METHODS
+
+The following methods are defined in this script.
+
+=over 4
+
+=cut
+
+#========================================================================#
+
+=pod
+
+=item B<parse_changelog_hunks_from_last_commit>
+
+Examine the last git commit and return a hash.  The keys of this hash are
+the filenames of ChangeLog files that were modified, the valus of this hash
+are list references.
+
+Each of the elements in these lists is a diff hunk.  Each diff hunk is
+represented as a list of lines.  Here is an example of the data structure:
+
+  { a/ChangeLog => [ HUNK1, HUNK2, HUNK3 ],
+    b/ChangeLog => [ HUNK1 ] }
+
+Where,
+
+  HUNK => [ LINE-1, LINE-2, LINE-3 ]
+
+=cut
+
+sub parse_changelog_hunks_from_last_commit {
+  open my $PATCH_OUTPUT, "git show HEAD|"
+    or die "Failed to run 'git show HEAD' command: $!";
+
+  my $ignore = true;
+  my %changelogs = ();
+  my $current_hunk = undef;
+  my $current_hunk_list = undef;
+  while (<$PATCH_OUTPUT>)
+  {
+    if (m#^diff --git a/.* b/(.*ChangeLog(?:\..*)?)$#)
+    {
+      $ignore = false;
+      (not (exists ($changelogs {$1}))) or
+        die "Found file '$1' twice in the diff";
+      $current_hunk_list = [];
+      $changelogs {$1} = $current_hunk_list;
+      $current_hunk = undef;
+    }
+    elsif (m#^diff --git #)
+    {
+      $ignore = true;
+      $current_hunk_list = undef;
+      $current_hunk = undef;
+    }
+
+    next if ($ignore);
+
+    if (m/^@@ .* @@/)
+    {
+      $current_hunk = [];
+      push @{$current_hunk_list}, $current_hunk;
+    }
+
+    next unless (defined $current_hunk);
+
+    # Add this line to the current hunk.
+    push @{$current_hunk}, $_;
+  }
+
+  close $PATCH_OUTPUT
+    or die "Faield to close pipe to 'git show HEAD' command: $!";
+
+  return %changelogs;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<fix_last_commit>
+
+Takes a hash-reference containing command line config settings.
+
+This function assumes that the current working directory is the repository
+root.
+
+The last commit is updated, the dates in any modified ChangeLogs are
+updated to the date string passed in within the command line settings
+hash-reference.
+
+=cut
+
+sub fix_last_commit {
+  my $config = shift;
+
+  my %changelogs = parse_changelog_hunks_from_last_commit ();
+
+  # We're done if there are no files in the ChangeLog list.
+  # TODO: Maybe there should be an option to give a warning here.
+  exit 0 if (not (keys %changelogs));
+
+  # Just print a summary of all the ChangeLog files we found that need
+  # updating.
+  print "Found:\n";
+  foreach my $filename (sort (keys (%changelogs)))
+  {
+    my $hunk_list = $changelogs {$filename};
+    my $count = scalar (@{$hunk_list});
+    print "  ". $filename ." with ". $count
+      ." hunk". ($count > 1 ? "s" : "") ."\n";
+  }
+
+  # This flag is set true if we find an error.  This controls what exit code
+  # the script gives.
+  my $invalid = false;
+
+  # Now iterate over all of the hunks in all of the ChangeLog files, and
+  # based on the contents of the hunk, update the ChangeLog file.
+  foreach my $filename (sort (keys (%changelogs)))
+  {
+    my $hunk_list = $changelogs {$filename};
+    my $count = scalar (@{$hunk_list});
+
+    if ($count > 1)
+    {
+      warn "Can't process $count hunks in '$filename' (yet)";
+      $invalid = true;
+      next;
+    }
+
+    foreach my $hunk (@{$hunk_list})
+    {
+      if (not (update_changelog_hunk ($config, $filename, $hunk)))
+      {
+        $invalid = true;
+      }
+    }
+  }
+
+  # All done.  If we found an error the user will already have been notified
+  # with a warning.  An exit value of 1 will cause git to stop rebasing (if
+  # this script is being used as the --exec command to a rebase), and thus
+  # the user can step in and address the issue.
+  exit ($invalid ? 1 : 0);
+}
+
+#========================================================================#
+
+=pod
+
+=item B<start_rebase>
+
+Start an interactive rebase to update all of the ChangeLog files in a
+series of commits.
+
+=cut
+
+sub start_rebase {
+  my $config = shift;
+
+  # Set this environment variable so that git does not try to open an
+  # editor and let the user edit the interactive git rebase sequence.
+  $ENV{GIT_SEQUENCE_EDITOR}="/bin/true";
+
+  # Now build the git rebase command.
+  my $options = "--fix-last-commit --date=\"".
+    $config->{__date_string__} ."\"";
+  if (not ($config->{__commit__}))
+  {
+    $options .= " --no-commit";
+  }
+  my $command = "git rebase --merge --interactive ".
+    "--exec \"git-update-changelogs $options\" -- ".
+    $config->{__upstream__};
+
+  # Run the rebase and then exit.
+  system ($command);
+  exit ($? >> 8);
+}
+
+#========================================================================#
+
+=pod
+
+=item B<chdir_to_repository_root>
+
+Assuming that we are in a git repository, or a sub-directory of a git
+repository, chdir into the root directory of the repository.
+
+If we are not in a git repository, or for some other reason we can't either
+establish where the root of the repository is, or can't chdir there, then
+die with an error message.
+
+=cut
+
+sub chdir_to_repository_root {
+  my $toplevel = `git rev-parse --show-toplevel 2>/dev/null`;
+  my $exit_code = $? >> 8;
+  ($exit_code == 128) and
+    die "not in a git repository\n";
+  ($exit_code == 0) or
+    die "failed to find git top-level directory\n";
+  chomp $toplevel;
+  chdir $toplevel or
+    die "failed to enter toplevel git directory '$toplevel': $!\n";
+}
+
+#========================================================================#
+
+=pod
+
+=item B<parse_command_line>
+
+Parse the command line options, and return a hash reference containing all
+of the user settings.
+
+=cut
+
+sub parse_command_line {
+  my $user_date_string = undef;
+  my $commit = true;
+  my $fix_last_commit = false;
+  my $help = false;
+
+  GetOptions ("fix-last-commit" => \$fix_last_commit,
+              "commit!" => \$commit,
+              "date=s" => \$user_date_string,
+              "help|h" => \$help) or pod2usage (2);
+  pod2usage (1) if ($help);
+
+  my $date_str = strftime "%F", localtime ();
+  if (defined $user_date_string)
+  {
+    # TODO: Should error check this user specified date string.
+    $date_str = $user_date_string;
+  }
+
+  my $upstream = shift @ARGV;
+
+  if ((defined $upstream) and $fix_last_commit)
+  {
+    die "can't specify an upstream ($upstream) and use --fix-last-commit\n";
+  }
+
+  if (not (defined ($upstream)))
+  {
+    $fix_last_commit = true;
+  }
+
+  my $config = {__commit__ => $commit,
+                __date_string__ => $date_str,
+                __fix_last_commit__ => $fix_last_commit,
+                __upstream__ => $upstream};
+  return $config;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<update_changelog_hunk>
+
+Takes hash-reference containing command line options, a filename for a
+ChangeLog file to update, and a hunk, which is a array-reference containing
+strings, that are the line of the diff hunk.
+
+The ChangeLog file passed in the filename is rewritten with the date
+updated if the hunk contains a line that requires updating.
+
+If the command line options allow it then the updated ChangeLog file is
+committed.
+
+=cut
+
+sub update_changelog_hunk {
+  my $config = shift;
+  my $filename = shift;
+  my $hunk = shift;
+
+  # Look through the diff hunk and extract some information about it.  If
+  # the hunk does not add any new lines then there can be no new ChangeLog
+  # entries to update.
+  #
+  # We also detect a few cases that are harder to update, and so are
+  # currently not supported, for example, we do add lines, but not a
+  # ChangeLog header line, or the new ChangeLog entry is not at the start
+  # of the file.
+  my $adds_line = false;
+  my $found_header = false;
+  my $edit_at_start_of_file = false;
+  my @headers;
+  foreach (@{$hunk})
+  {
+    chomp;
+
+    if (m/^@@ -(\d+),\d+ \+(\d+),\d+ @@/)
+    {
+      $found_header = true;
+      $edit_at_start_of_file = true;
+    }
+
+    if (m/^\+/)
+    {
+      $adds_line = true;
+
+      next if (m/^\+$/); # Added a blank line (ignore).
+      next if (m/^\+\t/); # Added a changelog content line.
+
+      if (m/^\+(\d{4}-\d{2}-\d{2}  .*  <.*>$)/)
+      {
+        # This is a header line of a ChangeLog entry.
+        push @headers, $1;
+        next;
+      }
+
+      warn "Unexpected ChangeLog line '$_'";
+      return false;
+    }
+  }
+
+  # Early returns based on the previous analysis.
+  return true unless ($adds_line);
+
+  if (not ($found_header))
+  {
+    warn "Cound not parse the hunk header for ChangeLog '$filename'";
+    return false;
+  }
+
+  if (not ($edit_at_start_of_file))
+  {
+    warn "ChangeLog edit is not at the start of the file in '$filename'";
+    return false;
+  }
+
+  if (not (-f $filename))
+  {
+    warn "Could not find file '$filename' to update";
+    return false;
+  }
+
+  # Now it's time to update the ChangeLog.  Figure out the new date we'll
+  # be using, then copy the ChangeLog file, updating entries as we find
+  # them.
+  my $date_str = $config->{__date_string__};
+
+  my ($out, $tmp_filename) = tempfile ( $filename.".XXXXXXXX" );
+  open my $in, $filename
+    or die "Failed to open '$filename' for reading: $!";
+
+  my $made_changes = false;
+  my $hl = pop @headers;
+  while (<$in>)
+  {
+    my $tmp = $_;
+    chomp $tmp;
+    if (defined ($hl) and ($hl eq $tmp))
+    {
+      if (substr ($_, 0, length ($date_str)) ne $date_str)
+      {
+        substr ($_, 0, length ($date_str)) = $date_str;
+        $made_changes = true;
+      }
+      $hl = pop @headers;
+    }
+
+    print $out $_;
+  }
+
+  close $in
+    or die "failed to close '$filename' after reading: $!\n";
+  close $out
+    or die "failed to close '$tmp_filename' after writing: $!\n";
+
+  # If no ChangeLog lines were modified (the date was already correct) then
+  # we just delete the temporary copy, and return.  There's no changes to
+  # commit.
+  if (not ($made_changes))
+  {
+    unlink $tmp_filename
+      or die "Failed to remove '$tmp_filename': $!";
+    return true;
+  }
+
+  move ($tmp_filename, $filename)
+    or die "Failed to move '$tmp_filename' over '$filename'";
+
+  # If the user has asked for the changes not to be automatically
+  # committed, then give a helpful message, and display the current git
+  # status.  Return false so the rebase stops at this point.
+  if (not ($config->{__commit__}))
+  {
+    print "\n";
+    print "Review the changes to ChangeLog files, then 'git add <files>' ";
+    print "and then\n"."commit the changes with 'git commit --amend'.\n";
+    print "\n";
+    system ("git status");
+    return false;
+  }
+
+  # Commit the modified file into the last commit, keeping the existing
+  # commit message.
+  system ("git commit --amend --no-edit --quiet -- $filename");
+  if ($? != 0)
+  {
+    warn "Error while ammending git commit";
+    return false;
+  }
+
+  return true;
+}
+
+#========================================================================#
+
+=pod
+
+=back
+
+=head1 AUTHOR
+
+Andrew Burgess, 28 Jun 2016
+
+=cut

@@ -1,0 +1,347 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+no indirect;
+no autovivification;
+
+#========================================================================#
+
+=pod
+
+=head1 NAME
+
+git-bgrep - a quick summary of what git-bgrep does.
+
+=head1 OPTIONS
+
+B<git-bgrep> [-h|--help] [remote] pattern
+
+=head1 SYNOPSIS
+
+A full description for git-bgrep has not yet been written.
+
+=cut
+
+#========================================================================#
+
+use Getopt::Long;
+use Pod::Usage;                 # Allow -h or --help command line options.
+use boolean;
+use Carp::Assert;
+
+#========================================================================#
+
+exit main ();
+
+#========================================================================#
+
+=pod
+
+=head1 METHODS
+
+The following methods are defined in this script.
+
+=over 4
+
+=cut
+
+#========================================================================#
+
+=pod
+
+=item B<main>
+
+The main program.
+
+=cut
+
+sub main {
+  my $opts = parse_command_line_options ();
+
+  my $match_spec = build_match_spec ($opts);
+
+  my @branches = load_branches (true);
+
+  my @matching = find_matching_branches ($match_spec, @branches);
+
+  my $datetype="committerdate"; ## Alternatively 'authordate'.
+
+  my $ref_list = build_ref_list (@matching);
+
+  # No matches found.
+  return 1 if ($ref_list eq "");
+
+  # Find the longest refname that git will display.
+  my $longest_ref_len
+    = `git for-each-ref --format='%(refname:short)' ${ref_list} | wc -L`;
+  chomp $longest_ref_len;
+
+  # Create a shell command to display all of the references, sorted in the
+  # correct order.
+  my $cmd = ("git for-each-ref --shell ".
+               "--sort=\"-${datetype}:iso8601\" ".
+               "--format=\"printf \\\"%%s %%${longest_ref_len}s\\t%%s\\n\\\" %(HEAD) %(refname:short) %(${datetype}:relative);\"".
+               "${ref_list}");
+
+  if ($opts->{lines} > 0)
+  {
+    $cmd = "$cmd | head -n".$opts->{lines};
+  }
+
+  $cmd = `$cmd`;
+
+  # Finally, run the shell command to display the list.  This should never
+  # return.
+  exec $cmd || return 1;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<parse_command_line_options>
+
+Parse command line options, return a reference to a hash containing the
+options.
+
+=cut
+
+sub parse_command_line_options {
+  my %opt = ();
+
+  my $all = false;
+  my $lines = -1;
+  my $help = false;
+  GetOptions ("all|a" => \$all,
+              "lines|n=i" => \$lines,
+              "help|h" => \$help) or pod2usage (2);
+  pod2usage (1) if ($help);
+
+  $opt{all} = $all;
+  $opt{lines} = $lines;
+
+  return \%opt;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<build_ref_list>
+
+Takes a list of matching branches and returns a string of ref names that
+can be used with git commands.  The list might be the empty string if the
+matching branches list is empty, but the returned string will always be
+defined.
+
+=cut
+
+sub build_ref_list {
+  my @matching = @_;
+
+  my $ref_list="";
+
+  foreach (@matching)
+  {
+    my $ref = "";
+
+    if (defined ($_->{__remote__}))
+    {
+      $ref = "refs/remotes/".$_->{__remote__}."/";
+    }
+    else
+    {
+      $ref = "refs/heads/";
+    }
+
+    $ref .= $_->{__branch__};
+    $ref_list .= " ".$ref;
+  }
+
+  assert (defined ($ref_list));
+
+  return $ref_list;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<is_matching_branch>
+
+Take a branch pattern and the name of a branch, return true if the branch
+name matches the pattern, otherwise, false.
+
+=cut
+
+sub is_matching_branch {
+  my $branch_pattern = shift;
+  my $branch_name = shift;
+
+  assert (defined ($branch_pattern));
+  assert (defined ($branch_name));
+
+  return ($branch_name =~ m/$branch_pattern/);
+}
+
+#========================================================================#
+
+=pod
+
+=item B<is_matching_remote>
+
+Take names of two remote, the first is the remote we are looking for, the
+second is the remote of the branch we are checking.
+
+This is NOT called if the '--all' flag is given so if the remote we are
+checking for is undef then we are only looking for local branches (the
+branch remote is also undef).
+
+=cut
+
+sub is_matching_remote {
+  my $spec_remote = shift;
+  my $branch_remote = shift;
+
+  # Handle case of looking for local branches only.
+  if (not (defined ($spec_remote)))
+  {
+    return not (defined ($branch_remote));
+  }
+
+  # The SPEC_REMOTE is not undef, so we're looking for a remote branch.  If
+  # BRANCH_REMOTE is undef then we have a local branch.
+  if (not (defined ($branch_remote)))
+  {
+    return false;
+  }
+
+  # Both remotes are defined, now check if we have a match.  Right now we
+  # only allow exact string matches.  Maybe in the future we should allow
+  # for pattern matching here.
+  return $spec_remote eq $branch_remote;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<find_matching_branches>
+
+Take a search spec (a hash from BUILD_MATCH_SPEC) and a list of branches
+(from LOAD_BRANCHES), and return a sub-list of the branches that match the
+spec.
+
+=cut
+
+sub find_matching_branches {
+  my $spec = shift;
+  my @branches = @_;
+
+  my @matching = ();
+  foreach my $b (@branches)
+  {
+    if (($spec->{__all__} or
+         is_matching_remote ($spec->{__remote__}, $b->{__remote__}))
+        and is_matching_branch ($spec->{__branch__}, $b->{__branch__}))
+    {
+      push @matching, $b;
+    }
+  }
+
+  return @matching;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<build_match_spec>
+
+Return a hash that defines the search we are doing.  Reads the global @ARGV
+to find command line flags and branch and/or remote patterns.
+
+=cut
+
+sub build_match_spec {
+  my $opts = shift;
+
+  my $all = $opts->{all};
+
+  my ($remote, $branch);
+  if (scalar (@ARGV) == 1)
+  {
+    $remote = undef;
+    $branch = $ARGV[0];
+  }
+  elsif (scalar (@ARGV) == 2)
+  {
+    pod2usage (1) if ($all);
+    $remote = $ARGV[0];
+    $branch = $ARGV[1];
+  }
+  else
+  {
+    pod2usage (1);
+  }
+
+  my $spec = { __all__ => $all,
+               __remote__ => $remote,
+               __branch__ => $branch };
+  return $spec;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<load_branches>
+
+Load all branches from git, return a list of hash references, where each
+hash reference identifies a branch.
+
+=cut
+
+sub load_branches {
+  my $load_remote_branches = shift;
+
+  my @branches = ();
+
+  my @local=`git for-each-ref --format='%(refname:lstrip=2)' refs/heads`;
+  foreach (@local)
+  {
+    chomp;
+    push @branches, { __remote__ => undef,
+                      __branch__ => $_ };
+  }
+
+  if ($load_remote_branches)
+  {
+    my @remote=`git for-each-ref --format='%(refname:lstrip=2)' refs/remotes`;
+    foreach (@remote)
+    {
+      chomp;
+
+      my ($remote, $branch) = (m#^([^/]+)/(.*)$#);
+      assert (defined ($remote));
+      assert (defined ($branch));
+      push @branches, { __remote__ => $remote,
+                        __branch__ => $branch };
+    }
+  }
+
+  return @branches;
+}
+
+#========================================================================#
+
+=pod
+
+=back
+
+=head1 AUTHOR
+
+Andrew Burgess, 28 Sep 2018
+
+=cut

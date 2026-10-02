@@ -1,0 +1,345 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+no indirect;
+no autovivification;
+
+#========================================================================#
+
+=pod
+
+=head1 NAME
+
+git-label - a quick summary of what git-label does.
+
+=head1 OPTIONS
+
+B<git-label> [-h|--help]
+
+=head1 SYNOPSIS
+
+A full description for git-label has not yet been written.
+
+=cut
+
+#========================================================================#
+
+use Getopt::Long;
+use Pod::Usage;                 # Allow -h or --help command line options.
+use List::Util qw/first/;
+use File::Temp qw/tempfile/;
+use boolean;
+use Carp::Assert;
+
+#========================================================================#
+
+my @add;
+my @remove;
+my $command_line = "";
+
+my $config = { add => [],
+               remove => [],
+               cmd_line => "",
+               base => undef};
+
+sub handle_arg
+{
+  my ($opt_name, $opt_value) = @_;
+
+  if ($opt_value =~ m/["']/)
+  {
+    die "invalid quote found in option value '$opt_value'";
+  }
+
+  push @{$config->{$opt_name}}, $opt_value;
+  $config->{cmd_line} = $config->{cmd_line} . " --$opt_name='$opt_value'";
+}
+
+
+my $help = false;
+GetOptions ("add=s" => \&handle_arg, "remove=s" => \&handle_arg,
+            "help|h" => \$help) or pod2usage (2);
+pod2usage (1) if ($help);
+$config->{base} = shift @ARGV;
+
+validate_labels ($config->{add});
+validate_labels ($config->{remove});
+
+if (defined $config->{base})
+{
+  start_rebase ($config);
+}
+else
+{
+  # Just fix the last commit.
+  fixup_last_commit ($config);
+}
+
+
+#========================================================================#
+
+=pod
+
+=head1 METHODS
+
+The following methods are defined in this script.
+
+=over 4
+
+=cut
+
+#========================================================================#
+
+=pod
+
+=item B<update_trailers>
+
+Take a config hash (with 'add' and 'remove' keys), and a filename.  Read the
+file, figrure out what the current trailers are, update the trailers based
+on the 'add' and 'remove' lists in the config hash, and then write the file
+back out (in place).
+
+=cut
+
+sub update_trailers {
+  my $config = shift;
+  my $filename = shift;
+
+  # Open file, read in content, splitting the main content and the trailers.
+  open my $in, $filename
+    or die "failed to open '$filename' for reading";
+
+  my @body_content = ();
+  my @trailer_content = ();
+  my $in_body = true;
+  while (<$in>)
+  {
+    if (m/^[^:]+: [^<]+ <[^>]+>$/)
+    {
+      $in_body = false;
+    }
+    elsif (m/^\s*$/)
+    {
+      # Nothing.
+    }
+    else
+    {
+      $in_body = true;
+      push @body_content, @trailer_content;
+      @trailer_content = ();
+    }
+
+    if ($in_body)
+    {
+      push @body_content, $_;
+    }
+    else
+    {
+      push @trailer_content, $_;
+    }
+  }
+
+  close $in
+    or die "failed to close '$filename' after reading";
+
+  # Amend the trailers list as required.
+  my %actions;
+  foreach my $add (@{$config->{add}})
+  {
+    $actions{$add} = 'add';
+  }
+  foreach my $remove (@{$config->{remove}})
+  {
+    $actions{$remove} = 'remove';
+  }
+
+  my @empty_lines = ();
+  my @new_trailer_content = ();
+  foreach my $t (@trailer_content)
+  {
+    my $tt = $t;
+    chomp $tt;
+
+    if ($t =~ m/^\s*$/)
+    {
+      push @empty_lines, $t;
+    }
+    elsif (exists $actions{$tt})
+    {
+      if ($actions{$tt} eq 'add')
+      {
+        push @new_trailer_content, @empty_lines;
+        @empty_lines = ();
+        push @new_trailer_content, $t;
+      }
+      else
+      {
+        assert ($actions{$tt} eq 'remove');
+      }
+      delete $actions{$tt};
+    }
+    else
+    {
+      push @new_trailer_content, @empty_lines;
+      @empty_lines = ();
+      push @new_trailer_content, $t;
+    }
+  }
+
+  foreach my $add (@{$config->{add}})
+  {
+    if (exists $actions{$add})
+    {
+      if ($actions{$add} eq 'add')
+      {
+        push @new_trailer_content, $add."\n";
+      }
+    }
+  }
+
+  push @new_trailer_content, @empty_lines;
+  @empty_lines = ();
+
+  # Write out the file with the original content, and the new trailers list.
+  open my $out, ">", $filename
+    or die "failed to open '$filename' for writing";
+
+  print $out @body_content;
+  print $out @new_trailer_content;
+
+  close $out
+    or die "failed to close '$filename' after writing";
+}
+
+#========================================================================#
+
+=pod
+
+=item B<fixup_last_commit>
+
+Takes a config hash with 'add' and 'remove' keys.  Grab the commit message
+of the previous commit, update the commit message based on the add and
+remove lists in the config hash, then amend the previous commit.
+
+=cut
+
+sub fixup_last_commit {
+  my $config = shift;
+
+  my $cmd;
+
+  $cmd = 'git --no-pager show --format="Updating: %h %s" --no-patch';
+  system ($cmd);
+
+
+  # Write the commit message of the previous commit out to a file.
+  my ($fh, $filename) = tempfile ();
+  $cmd = 'git show --no-patch --format="%s%n%n%b" > ' . $filename;
+  system ($cmd);
+  if ($? != 0)
+  {
+    warn "Failed to extract previous commit message";
+    unlink $filename;
+    return false;
+  }
+
+  close $fh or
+    die "Failed to close filehandle for '$filename'";
+
+  # Add or remove trailers as required.
+  update_trailers ($config, $filename);
+
+  # Ammend the previus commit using the new commit message.
+  $cmd = "git commit -F $filename --amend --quiet";
+  system ($cmd);
+  if ($? != 0)
+  {
+    warn "Failed to amend previous commit message";
+    unlink $filename;
+    return false;
+  }
+
+  unlink $filename;
+  return true;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<validate_labels>
+
+Currently undocumented.
+
+=cut
+
+sub validate_labels {
+  my $labels_ref = shift;
+
+  my @labels = @$labels_ref;
+  @$labels_ref = ();
+
+  foreach my $label (@labels)
+  {
+    if ($label =~ m/^([^:]+): ([^<]+)\s+<([^>]+)>$/)
+    {
+      my $tag = $1;
+      my $name = $2;
+      my $email = $3;
+
+      my @all_tags = qw/Approved-By Reviewed-By Co-Authored-By Tested-By Acked-By/;
+
+      my $matching_tag = first { uc ($tag) eq uc ($_) } @all_tags;
+      if ($matching_tag)
+      {
+        push @$labels_ref, "$matching_tag: $name <$email>";
+      }
+      else
+      {
+        die "Invalid tag '$tag'";
+      }
+    }
+    else
+    {
+      die "Invalid label: '$label'";
+    }
+  }
+}
+
+#========================================================================#
+
+=pod
+
+=item B<start_rebase>
+
+Start an interactive rebase to update all of the ChangeLog files in a
+series of commits.
+
+=cut
+
+sub start_rebase {
+  my $config = shift;
+
+  # Set this environment variable so that git does not try to open an
+  # editor and let the user edit the interactive git rebase sequence.
+  $ENV{GIT_SEQUENCE_EDITOR}="/bin/true";
+
+  # Now build the git rebase command.
+  my $options = $config->{cmd_line};
+  my $command = "git rebase --quiet --merge --interactive ".
+    "--exec \"$0 $options\" -- ".
+    $config->{base};
+
+  # Run the rebase and then exit.
+  system ($command);
+  exit ($? >> 8);
+}
+
+#========================================================================#
+
+=pod
+
+=back
+
+=cut

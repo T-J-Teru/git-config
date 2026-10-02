@@ -1,0 +1,149 @@
+#!/bin/env bash
+
+#!/bin/bash
+
+# git-repo-id
+#
+# This script provides a unique identifier for a Git repository.
+#
+# In a clean repository, it prints the output of 'git describe --always --exclude="*"'.
+# This typically gives a short SHA-1 hash of the current commit.
+#
+# In a dirty repository (i.e., with uncommitted changes in the working directory
+# or staging area), it prints a string in the format:
+# [INITIAL SHA]-dirty-[SECOND SHA]
+#
+# By default, [SECOND SHA] is truncated to 16 characters.
+# Use --full-dirty-sha to get the complete SHA256 hash.
+
+# --- Configuration ---
+# Default to truncated dirty SHA
+FULL_DIRTY_SHA=false
+
+# By default, don't show the diff used to create the dirty SHA.
+SHOW_DIRTY_SHA_DIFF=false
+
+# --- Function to display help message ---
+display_help() {
+  echo "Usage: git repo-id [OPTIONS]"
+  echo "Provides a unique identifier for a Git repository."
+  echo ""
+  echo "Options:"
+  echo "  --full-dirty-sha    Do not truncate the [SECOND SHA] in dirty repositories."
+  echo "                      By default, it is limited to 16 characters."
+  echo "  --show-dirty-diff   Show the diff used to generate the [SECOND_SHA], then exit."
+  echo "  --help              Display this help message and exit."
+  echo ""
+  echo "Examples:"
+  echo "  git repo-id"
+  echo "  git repo-id --full-dirty-sha"
+  exit 0
+}
+
+# --- Parse Command Line Options ---
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --full-dirty-sha)
+      FULL_DIRTY_SHA=true
+      ;;
+    --show-dirty-diff)
+      SHOW_DIRTY_SHA_DIFF=true
+      ;;
+    --help)
+      display_help
+      ;;
+    *)
+      echo "Error: Unknown option: $1" >&2
+      display_help # Show help and exit on unknown option
+      ;;
+  esac
+  shift # Move to the next argument
+done
+
+# --- Error Handling ---
+# Check if the current directory is part of a Git repository.
+# 'git rev-parse --is-inside-work-tree' returns 0 if inside, non-zero otherwise.
+# We redirect stdout and stderr to /dev/null to keep the output clean.
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+  echo "Error: Not a Git repository." >&2 # Output error to stderr
+  exit 1 # Exit with a non-zero status to indicate failure
+fi
+
+# --- Get Initial SHA ---
+# This command gets the shortest unique SHA-1 hash of the current commit.
+# '--always' ensures a hash is always returned, even if no tags are present.
+# '--exclude="*"' prevents 'git describe' from trying to find the nearest tag,
+# ensuring we just get the commit hash.
+initial_sha=$(git describe --always --exclude='*')
+
+# Output all changes in the current git repository, including cached,
+# uncached, and untracked files.  Even empty files (in any state) will
+# appear in the diff.
+full_git_diff() {
+  while IFS= read -r line; do
+    status=${line:0:2}
+    file=${line:3}
+
+    if test "$status" == "??"; then
+      git diff --no-index /dev/null "$file" | cat
+    elif test "status" == "M "; then
+      git diff --cached -- "$file" | cat
+    else
+      git diff -- "$file" | cat
+    fi
+
+  done < <(git status --porcelain)
+}
+
+# --- Check If Repository Is Clean ---
+# 'git status --porcelain' provides machine-readable output.
+# If there are no uncommitted changes (in working tree or index), its output is empty.
+# If there are any changes, it will output lines indicating them.
+if [[ -z $(git status --porcelain) ]]; then
+  REPO_IS_CLEAN=true
+else
+  REPO_IS_CLEAN=false
+fi
+
+# --- Possibly Show Dirty Diff ---
+# If the user requested it, then show the dirty diff, and exit.
+if "$SHOW_DIRTY_SHA_DIFF"; then
+  if "$REPO_IS_CLEAN"; then
+    echo "Repository is clean, there is no dirty diff."
+  else
+    echo "Diff of repositories dirty state:"
+    echo "----------------------------------------------------------------------"
+    full_git_diff
+    echo "----------------------------------------------------------------------"
+    echo ""
+  fi
+
+  exit 0
+fi
+
+# --- Produce Repository Id String ---
+if "$REPO_IS_CLEAN"; then
+  # Repository is clean: print the initial SHA.
+  echo "$initial_sha"
+else
+  # Repository is dirty: calculate the second SHA and format the output.
+
+  # 'git diff' outputs the differences between the working tree/index and HEAD.
+  # This captures all uncommitted changes.
+  # We pipe this output to 'sha256sum' to get a hash of the changes.
+  # 'cut -d ' ' -f 1' extracts only the SHA256 hash from sha256sum's output.
+  full_dirty_sha_raw=$(full_git_diff | sha256sum | cut -d ' ' -f 1)
+
+  # Apply truncation based on the FULL_DIRTY_SHA flag.
+  if "$FULL_DIRTY_SHA"; then
+    dirty_sha="$full_dirty_sha_raw"
+  else
+    # Take the first 16 characters.
+    dirty_sha="${full_dirty_sha_raw:0:16}"
+  fi
+
+  # Combine the initial SHA, "dirty" indicator, and the dirty SHA.
+  echo "${initial_sha}-dirty-${dirty_sha}"
+fi
+
+exit 0

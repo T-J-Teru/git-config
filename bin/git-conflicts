@@ -1,0 +1,414 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+#========================================================================#
+
+=pod
+
+=head1 NAME
+
+git-conflicts - display conflict files within a git repository.
+
+=head1 OPTIONS
+
+B<git-conflicts> [-h|--help] [--sort=WHAT]
+
+=head1 SYNOPSIS
+
+Run as 'git conflicts', and displays the files with conflicts within the
+current repository.  For each file with conflicts the number of conflicts
+within the file are displayed, as well as the total number of lines that
+are removed, and added over all conflicts within that file.
+
+For example:
+
+  $ git conflicts
+  | Filename | Conflicts |  Out/In |
+  +----------+-----------+---------+
+  | a/b.c    |         3 |  -20/+4 |
+
+This shows that the file 'a/b.c' has 3 conflict regions, and over all of
+these 3 regions, 20 lines are taken out, and 4 lines are added back in.
+This (hopefully) gives an impressions of how serious the conflicts are.
+
+[ Obviously, even a small conflict could be hard to resolve, while a large
+conflict could be easy, however, experience tells me that on average, these
+figures give a good first impression.  ]
+
+It is possible for an entry to show up in the table with the number of
+conflicts being 0, and with no lines in the conflict regions.  This either
+means you've resolved the conflicts in this file (and forgotten), or that
+the file was deleted in one of the versions, and modified in the other,
+hence the whole file is placed in the tree and marked as a conflict.
+
+=head1 COMMAND LINE OPTIONS
+
+=over 2
+
+=item B<-h> | B<--help>
+
+Display help text.
+
+=item B<--sort=>I<WHAT>
+
+Sort the table of conflicts, I<WHAT> can be one of:
+
+=over 2
+
+=item I<filename>
+
+Sort by filename.
+
+=item I<conflicts>
+
+Sort by the number of conflict regions.
+
+=item I<lines>
+
+Sort by the number of lines contained in all of the conflict regions.
+
+=back
+
+=item B<--show>=I<FILENAME>
+
+Show how I<FILENAME> was changed in the original patch.
+
+=item B<-add>
+
+Add files that have no conflicts, but are still in the "both modified"
+state.
+
+=back
+
+=cut
+
+#========================================================================#
+
+use List::Util qw/max/;
+use Pod::Usage;                 # Allow -h or --help command line options.
+use Getopt::Long;
+use Carp::Assert;
+use boolean;
+
+#========================================================================#
+
+my $sorting = "none";
+my $reverse = false;
+my $show = undef;
+my $do_add = false;
+my $help = false;
+GetOptions ("sort=s" => \$sorting,
+            "reverse|r" => \$reverse,
+            "show=s" => \$show,
+            "add" => \$do_add,
+            "help|h" => \$help) or pod2usage (2);
+pod2usage (1) if ($help);
+
+$sorting = lc ($sorting);
+($sorting eq "none"
+   || $sorting eq "filename"
+   || $sorting eq "conflicts"
+   || $sorting eq "lines")
+  or die ("Invalid sorting strategy '$sorting' ".
+            "(use none, filename, conflicts, or lines)\n");
+
+# Try to figure out what we might be conflicting with.
+my $conflict_with = git_find_conflicting_sha ();
+if (defined $conflict_with)
+{
+  print "Conflicting with: $conflict_with\n";
+}
+
+if (defined $show)
+{
+  (not $do_add) or
+    die "Don't use --add and --show\n";
+  (defined ($conflict_with))
+    or die "Unable to find original commit SHA";
+  system ("git show $conflict_with -- $show");
+  exit ($?);
+}
+
+print "Finding conflict files...\n";
+my @conflict_files = `git diff --name-only --diff-filter=U`;
+
+if (not @conflict_files)
+{
+  print "No conflicts.\n";
+  exit (1);
+}
+
+print "Found ". scalar (@conflict_files) ." files with conflicts.\n";
+
+# Make sure that we're in the root of the repository.
+my $root_dir = `git rev-parse --show-toplevel`;
+chomp $root_dir;
+if ((not ( -d $root_dir )) or (not (chdir $root_dir)))
+{
+  print "Could not change to root directory: $root_dir";
+  exit (1);
+}
+
+# Initial values based on the strings that are used as headers in each
+# column.
+my $max = { -filename => 8,
+            -count_str => 5,
+            -in_out_str => 6 };
+
+@conflict_files = map {
+  my $file = $_;
+  chomp $file;
+
+  my ($count, $in, $out) = analyse_conflicts ($file);
+  my $result = { -filename => $file,
+                 -count_str => sprintf ("%d", $count),
+                 -in_out_str => sprintf ("-%d/+%d", $out, $in),
+                 -count => $count,
+                 -in => $in,
+                 -out => $out
+               };
+
+  foreach my $f (qw/-filename -count_str -in_out_str/)
+  {
+    if (length ($result->{ $f }) > $max->{ $f })
+    {
+      $max->{ $f } = length ($result->{ $f });
+    }
+  }
+
+  $result;
+} @conflict_files;
+
+if ($do_add)
+{
+  my $have_added = 0;
+
+  foreach (@conflict_files)
+  {
+    if ($_->{-count} == 0)
+    {
+      $have_added++;
+      print "Adding '".$_->{-filename}."'\n";
+      system ("git add \"".$_->{-filename}."\"");
+    }
+  }
+
+  if ($have_added == 0)
+  {
+    print "No files needed adding\n";
+  }
+  else
+  {
+    # Discard all entries we just added, then drop through and show all of
+    # the remaining conflict files.
+    @conflict_files = grep { $_->{-count} != 0 } @conflict_files;
+
+    if (not @conflict_files)
+    {
+      print "No conflicts remaining.\n";
+      exit (0);
+    }
+  }
+}
+
+if ($sorting ne "none")
+{
+  my $sort_function = undef;
+  if ($sorting eq "filename")
+  {
+    $sort_function = sub {
+      $a->{ -filename } cmp $b->{ -filename };
+    }
+  }
+  elsif ($sorting eq "conflicts")
+  {
+    $sort_function = sub {
+      if ($a->{ -count } == $b->{ -count })
+      {
+        $a->{ -filename } cmp $b->{ -filename };
+      }
+      else
+      {
+        $a->{ -count } <=> $b->{ -count };
+      }
+    }
+  }
+  elsif ($sorting eq "lines")
+  {
+    $sort_function = sub {
+      if (($a->{ -in } + $a->{ -out }) == ($b->{ -in } + $b->{ -out }))
+      {
+        $a->{ -filename } cmp $b->{ -filename };
+      }
+      else
+      {
+        ($a->{ -in } + $a->{ -out }) <=> ($b->{ -in } + $b->{ -out });
+      }
+    }
+  }
+
+  assert (defined ($sort_function));
+  @conflict_files = sort $sort_function @conflict_files;
+}
+
+# And do the reverse if required.
+@conflict_files = reverse @conflict_files if ($reverse);
+
+my $format = "| %-*s | %*s | %*s |\n";
+  printf $format,
+    $max->{ -filename }, "Filename",
+    $max->{ -count_str }, "Count",
+    $max->{ -in_out_str }, "Out/In";
+
+print "+-".("-"x$max->{ -filename }).
+  "-+-".("-"x$max->{ -count_str }).
+  "-+-".("-"x$max->{ -in_out_str })."-+\n";
+foreach my $file (@conflict_files)
+{
+  printf $format,
+    $max->{ -filename }, $file->{ -filename },
+    $max->{ -count_str }, $file->{ -count_str },
+    $max->{ -in_out_str }, $file->{ -in_out_str };
+}
+
+#========================================================================#
+
+=pod
+
+=head1 METHODS
+
+The following methods are defined in this script.
+
+=over 4
+
+=cut
+
+#========================================================================#
+
+=pod
+
+=item B<git_find_conflicting_sha>
+
+Look in the .git/sequencer/todo file and return the SHA for the first
+entry, this should be the entry we're currently in conflict with.
+
+If there's no such entry, or the file does not exist then return undef.
+
+=cut
+
+sub git_find_conflicting_sha {
+  my $git_root = `git rev-parse --git-dir`;
+  chomp $git_root;
+
+  my $cp_file = $git_root."/CHERRY_PICK_HEAD";
+  if (-r $cp_file)
+  {
+    # TODO: Write this in pure perl.
+    my $sha = `head -n1 $cp_file`;
+    chomp $sha;
+    $sha = `git rev-parse --short $sha`;
+    chomp $sha;
+    return $sha;
+  }
+
+  my $todo_file = $git_root."/sequencer/todo";
+  if (-r $todo_file)
+  {
+    # TODO: Write this in pure perl.
+    my $sha = `head -n1 $todo_file | cut -d' ' -f 2`;
+    chomp $sha;
+    $sha = `git rev-parse --short $sha`;
+    chomp $sha;
+    return $sha;
+  }
+
+  my $rebase_file = $git_root."/rebase-apply/original-commit";
+  if (-r $rebase_file)
+  {
+    # TODO: Write this in pure perl.
+    my $sha = `head -n1 $rebase_file`;
+    chomp $sha;
+    $sha = `git rev-parse --short $sha`;
+    chomp $sha;
+    return $sha;
+  }
+
+  my $rebase_sha = $git_root."/rebase-merge/stopped-sha";
+  if (-r $rebase_sha)
+  {
+    # TODO: Write this in pure perl.
+    my $sha = `head -n1 $rebase_sha`;
+    chomp $sha;
+    $sha = `git rev-parse --short $sha`;
+    chomp $sha;
+    return $sha;
+  }
+
+  return undef;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<analyse_conflicts>
+
+Take a sting that is a file name, and return a list of three items, these
+three items are: (1) The number of conflict regions in the file, (2) The
+number of lines added, and (3) The number of lines removed.
+
+Will die with an error if there's a problem opening, or closing the file.
+
+Will return 3 0's if there are no conflicts in the file.
+
+=cut
+
+sub analyse_conflicts {
+  my $filename = shift;
+
+  open my $fh, $filename
+    or die "Failed to open '$filename': $!";
+
+  my $conflicts = 0;
+  my ($in, $out) = (0, 0);
+  my $counter = undef;
+  while (<$fh>)
+  {
+    if (m/^<<<<<<< / or m/^<<<<<<<$/)
+    {
+      $conflicts++;
+      $counter = \$out;
+    }
+    elsif (m/^=======$/)
+    {
+      $counter = \$in;
+    }
+    elsif (m/^>>>>>>> / or m/^>>>>>>>$/)
+    {
+      $counter = undef;
+    }
+    else
+    {
+      $$counter++ if (defined $counter);
+    }
+  }
+
+  close $fh
+    or die "Failed to close '$filename': $!";
+
+  return ($conflicts, $in, $out);
+}
+
+#========================================================================#
+
+=pod
+
+=back
+
+=head1 AUTHOR
+
+Andrew Burgess, 10 Mar 2016
+
+=cut

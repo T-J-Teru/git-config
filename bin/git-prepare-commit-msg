@@ -1,0 +1,368 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+no indirect;
+no autovivification;
+
+#========================================================================#
+
+=pod
+
+=head1 NAME
+
+git-prepare-commit-msg - used as a git hook 'prepare-commit-msg'.
+
+=head1 OPTIONS
+
+B<git-prepare-commit-msg> [-h|--help] FILENAME SOURCE SHA1
+
+=head1 SYNOPSIS
+
+This should be installed as a git hook in .git/hooks/prepare-commit-msg, it
+extracts ChangeLog entries and inserted them into the commit message
+buffer.
+
+I<FILENAME> should be an existing file which will be rewritten in place
+with the new template commit message.  If this is the special value "-" (a
+single dash without the quotes), then the template commit message is
+written to stdout.
+
+I<SOURCE> should be a string, one of message, template, merge, squash, or
+commit.
+
+I<SHA1> is optional and should be a git sha1.
+
+=cut
+
+#========================================================================#
+
+use boolean;
+use Pod::Usage;                 # Allow -h or --help command line options.
+use List::MoreUtils qw/any/;
+
+#========================================================================#
+
+my $verbose_mode = false;
+
+#========================================================================#
+
+# Handle -h/--help directly: this hook takes positional arguments (FILENAME
+# SOURCE SHA1) rather than options, so there's no Getopt::Long parsing. Do this
+# before the print below so --help shows usage rather than the argument dump.
+pod2usage (1) if (any { $_ eq "-h" or $_ eq "--help" } @ARGV);
+
+print "Argument: @ARGV\n";
+
+my $filename = shift;
+my $source = shift;
+my $sha1 = shift;
+
+if (not (defined ($source)))
+{
+  $source = "default";
+}
+
+(defined $filename) and (defined $source) or
+  die ("missing FILENAME and/or SOURCE arguments\n");
+
+my @valid_source = qw/message template merge squash commit default/;
+any { $source eq $_ } @valid_source or
+  die ("invalid SOURCE argument '$source'\n");
+
+my @lines = reverse (load_current_msg ($filename));
+
+my %cl = parse_changelog_hunks_from_last_commit ();
+convert_changelog_hunks_to_msg (\%cl);
+
+# Now we need to remove any existing ChangeLog blocks at the end of this
+# commit message, and add back our own content.
+#
+# We process the contents of LINES in order (remember that LINES has been
+# reveresed, so we're actually going from the end of the file).
+#
+# Comment lines are copied over.
+#
+# Blank lines are skipped.
+#
+# Lines starting 
+my @new_lines;
+my @tmp_lines;
+my $finished = false;
+
+foreach my $line (@lines)
+{
+  my $t = $line;
+  chomp $t;
+  verbose ("Line '$t'\n");
+
+  # If we have finished processing then just copy the rest of the lines
+  # over.  Or, if we have a comment line, just copy it over.
+  if ($finished or $line =~ m/^#/)
+  {
+    verbose ("  Just pass through\n");
+    push @new_lines, $line;
+    next;
+  }
+
+  # Skip blank lines.
+  next if ($line =~ m/^$/);
+
+  if ($line =~ m/^(\S+):$/)
+  {
+    my $filename = $1;
+    verbose ("  Possible ChangeLog banner line for '$filename'\n");
+    if (exists ($cl{$filename}))
+    {
+      verbose ("  Found ChangeLog entry for '$filename'\n");
+      # We can discard everything from TMP_LINES as this should be the
+      # ChangeLog entry for FILENAME.
+      @tmp_lines = ();
+    }
+    else
+    {
+      verbose ("  Unknown line, we're done\n");
+      # This is a line we don't know what to do with.  Add all outstanding
+      # lines from TMP_LINES, and then add this line.
+      push @new_lines, @tmp_lines;
+      push @new_lines, $line;
+
+    foreach my $filename (sort (keys (%cl)))
+    {
+      push @new_lines, "\n";
+      push @new_lines, $cl{$filename};
+    }
+
+      $finished = true;
+    }
+  }
+  elsif ($line =~ m/^\t.+$/)
+  {
+    verbose ("  Possible ChangeLog line\n");
+    # This line could be part of a ChangeLog entry.  Add it to TMP_LINES
+    # for now until we know what to do with it.
+    push @tmp_lines, $line;
+  }
+  else
+  {
+    verbose ("  Unknown line (case 2), we're done\n");
+    # This is a line we don't know what to do with.  Add all outstanding
+    # lines from TMP_LINES, and then add this line.
+    push @new_lines, @tmp_lines;
+
+    foreach my $filename (sort (keys (%cl)))
+    {
+      push @new_lines, $cl{$filename};
+      push @new_lines, "\n";
+    }
+
+    push @new_lines, $line;
+    $finished = true;
+  }
+}
+
+if (not $finished)
+{
+  foreach my $filename (sort (keys (%cl)))
+  {
+    push @new_lines, $cl{$filename};
+    push @new_lines, "\n";
+  }
+}
+
+for my $line (reverse (@new_lines))
+{
+  print $line;
+}
+
+#========================================================================#
+
+=pod
+
+=head1 METHODS
+
+The following methods are defined in this script.
+
+=over 4
+
+=cut
+
+#========================================================================#
+
+=pod
+
+=item B<verbose>
+
+Currently undocumented.
+
+=cut
+
+sub verbose {
+  my @lines = @_;
+
+  if (not $verbose_mode)
+  {
+    return;
+  }
+
+  print @lines;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<convert_changelog_hunks_to_msg>
+
+Currently undocumented.
+
+=cut
+
+sub convert_changelog_hunks_to_msg {
+  my $changelogs = shift;
+
+  foreach my $filename (keys (%{$changelogs}))
+  {
+    my $hunk_list = $changelogs->{$filename};
+    my $count = scalar (@{$hunk_list});
+    ($count == 1) or
+      die ("unexpected number of changelog hunks in '$filename' ($count)\n");
+
+    if ($filename =~ m/(.*ChangeLog)\.\S+$/)
+    {
+      my $untagged_filename = $1;
+      if (not (exists ($changelogs->{$untagged_filename})))
+      {
+        delete $changelogs->{$filename};
+        $filename = $untagged_filename;
+      }
+    }
+
+    my $msg = "$filename:\n\n";
+
+    foreach my $hunk (@{$hunk_list})
+    {
+      foreach my $line (@{$hunk})
+      {
+        next unless ($line =~ m/^\+/);
+        next if ($line =~ m/^\+\d\d\d\d-\d\d-\d\d  /);
+        next if ($line =~ m/^\+$/);
+        $line =~ s/^\+//;
+        $msg .= $line;
+      }
+    }
+
+    $changelogs->{$filename} = $msg;
+  }
+}
+
+#========================================================================#
+
+=pod
+
+=item B<parse_changelog_hunks_from_last_commit>
+
+Examine the last git commit and return a hash.  The keys of this hash are
+the filenames of ChangeLog files that were modified, the valus of this hash
+are list references.
+
+Each of the elements in these lists is a diff hunk.  Each diff hunk is
+represented as a list of lines.  Here is an example of the data structure:
+
+  { a/ChangeLog => [ HUNK1, HUNK2, HUNK3 ],
+    b/ChangeLog => [ HUNK1 ] }
+
+Where,
+
+  HUNK => [ LINE-1, LINE-2, LINE-3 ]
+
+=cut
+
+sub parse_changelog_hunks_from_last_commit {
+  open my $PATCH_OUTPUT, "git show HEAD|"
+    or die "Failed to run 'git show HEAD' command: $!";
+
+  my $ignore = true;
+  my %changelogs = ();
+  my $current_hunk = undef;
+  my $current_hunk_list = undef;
+  while (<$PATCH_OUTPUT>)
+  {
+    if (m#^diff --git a/.* b/(.*ChangeLog(?:\..*)?)$#)
+    {
+      $ignore = false;
+      (not (exists ($changelogs {$1}))) or
+        die "Found file '$1' twice in the diff";
+      $current_hunk_list = [];
+      $changelogs {$1} = $current_hunk_list;
+      $current_hunk = undef;
+    }
+    elsif (m#^diff --git #)
+    {
+      $ignore = true;
+      $current_hunk_list = undef;
+      $current_hunk = undef;
+    }
+
+    next if ($ignore);
+
+    if (m/^@@ .* @@/)
+    {
+      $current_hunk = [];
+      push @{$current_hunk_list}, $current_hunk;
+    }
+
+    next unless (defined $current_hunk);
+
+    # Add this line to the current hunk.
+    push @{$current_hunk}, $_;
+  }
+
+  close $PATCH_OUTPUT
+    or die "Faield to close pipe to 'git show HEAD' command: $!";
+
+  return %changelogs;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<load_current_msg>
+
+Take the name of a file and return a list of the lines in that file.  If
+the filename is the special value "-" (single dash without the quotes),
+then return an empty list without trying to open and read any file.
+
+=cut
+
+sub load_current_msg {
+  my $filename = shift;
+
+  my @lines = ();
+  if ($filename eq "-")
+  {
+    return @lines;
+  }
+
+  open my $fh, $filename or
+    die "failed to open '$filename': $!\n";
+
+  foreach my $line (<$fh>)
+  {
+    push @lines, $line;
+  }
+
+  close $fh or
+    die "failed to close '$filename': $!\n";
+
+  return @lines;
+}
+
+#========================================================================#
+
+=pod
+
+=back
+
+=cut

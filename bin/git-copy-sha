@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Ensure xclip is available
+if ! command -v xclip &>/dev/null; then
+    echo "Error: xclip is not installed." >&2
+    exit 1
+fi
+
+SHORT_FLAG=""
+REV=""
+
+# Parse command-line arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --short|-s)
+            SHORT_FLAG="--short"
+            shift
+            ;;
+        -*)
+            echo "Error: Unknown option '$1'" >&2
+            echo "Usage: git-copy-sha [--short|-s] [<revision>]" >&2
+            exit 1
+            ;;
+        *)
+            if [[ -z "$REV" ]]; then
+                REV="$1"
+            else
+                echo "Error: Too many arguments." >&2
+                echo "Usage: git-copy-sha [--short|-s] [<revision>]" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Default to HEAD if no revision argument is provided
+REV="${REV:-HEAD}"
+
+# Resolve commit ref to a SHA (short or full)
+if ! SHA=$(git rev-parse $SHORT_FLAG --verify "${REV}^{commit}" 2>/dev/null); then
+    echo "Error: '${REV}' is not a valid commit revision." >&2
+    exit 1
+fi
+
+# Copy SHA to clipboard without trailing newlines
+printf "%s" "$SHA" | xclip -in -selection clipboard
+
+echo "Copied $SHA to clipboard."

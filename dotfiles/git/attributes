@@ -1,0 +1,4 @@
+ChangeLog       merge=merge-changelog
+ChangeLog.*     merge=merge-changelog
+*.texi*         diff=texinfo
+*.py		whitespace=tab-in-indent,trailing-space
