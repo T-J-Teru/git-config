@@ -72,10 +72,20 @@ Things worth knowing (first-pass items to revisit):
     doesn't read `~/.gitattributes` by default. Only the canonical
     `~/.config/git/attributes` is kept.
 
+## License
+
+This repository is licensed under the GNU General Public License, version 3 or
+later — see [LICENSE](LICENSE). The `bin/` scripts I wrote and `install.sh` carry
+the GPLv3 license-grant header; the git config files (`gitconfig`, `attributes`,
+`gitk`) are left unheadered.
+
+`bin/git-wtf` is the one exception: it's a third-party script by William Morgan,
+already distributed under GPLv3-or-later (it keeps its own `COPYRIGHT` notice). It
+is license-compatible but not my work, so it does not carry the repo's header —
+see the note at the top of that file.
+
 ## Open questions
 
 - `git-prepare-commit-msg` is kept as a `~/bin` script. If it's meant to run as a
   git **hook** (its name matches the `prepare-commit-msg` hook), it may need wiring
   via `core.hooksPath` or a per-repo hook instead — revisit.
-- Licensing: no license chosen yet. Several scripts are third-party (e.g. `git-wtf`)
-  and carry their own headers; sort out licensing before publishing.
