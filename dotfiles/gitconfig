@@ -64,6 +64,10 @@
         whitespace = space-before-tab,indent-with-non-tab,trailing-space
         #fsmonitor = true
         #untrackedCache = true
+        # emacs -nw directly (not via $EDITOR), so git's editor works regardless of
+        # PATH / the ~/bin/emacs-nw script. Also covers the rebase-todo editor, since
+        # sequence.editor falls back to core.editor.
+        editor = emacs -nw
 
 [format]
         outputDirectory = patches
